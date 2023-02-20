@@ -272,7 +272,7 @@ def extractRenameItems(paths):
         if abspath in added:
             ErrorManager.error(abspath, "supplied multiple times")
             continue
-        if not os.path.exists(path):
+        if not os.path.exists(path) and not os.path.islink(path):
             ErrorManager.error(abspath, "not found")
         added.add(abspath)
         items.append(RenameItem(path))
