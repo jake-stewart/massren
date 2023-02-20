@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import subprocess
+import functools
+import pathlib
+import tempfile
+import shutil
+import platform
+
+if platform.system() == "Darwin":
+    ILLEGAL_CHARS = "/:" 
+else:
+    ILLEGAL_CHARS = "/" 
+
+class ErrorManager:
+    hasError = False
+
+    def error(arg1, *args):
+        ErrorManager.hasError = True
+        print("error:", arg1, *args, file=sys.stderr)
+
+    def abort(*args):
+        if args:
+            ErrorManager.error(*args)
+        print("error(s) occurred. aborted.")
+        exit(1)
+
+    def abortIfError():
+        if ErrorManager.hasError:
+            ErrorManager.abort()
+
+def safeRename(src, dest):
+    if os.path.exists(dest):
+        # this error should be impossible. occurrence = bug
+        fmt = "could not rename %s -> %s since the destination exists."
+        ErrorManager.abort(fmt % (src, dest))
+    os.rename(src, dest)
+
+class RenameItem:
+    def __init__(self, displayPath):
+        abspath = os.path.abspath(displayPath)
+        self._displayPath = displayPath
+        self._name = os.path.basename(abspath)
+        self._path = pathlib.PurePath(abspath)
+        self._rename = None
+        self._renamePath = None
+
+    def getName(self):
+        return self._name
+
+    def getPath(self):
+        return self._path
+
+    def getDisplayPath(self):
+        return self._displayPath
+
+    def getRename(self):
+        return self._rename
+
+    def getRenamePath(self):
+        return self._renamePath
+
+    def setRename(self, rename):
+        self._rename = rename
+        if not rename:
+            ErrorManager.error(self.getDisplayPath(), "renamed to nothing")
+            return
+        if any(char in rename for char in ILLEGAL_CHARS):
+            ErrorManager.error(self, "contains illegal character(s)")
+            return
+        directory = os.path.dirname(self._path)
+        self._renamePath = pathlib.PurePath(directory) / rename \
+                if rename else None
+
+    def __str__(self):
+        return self._displayPath + " -> " + str(self._rename)
+
+class SingleRenameStrategy:
+    def __init__(self, renameItem):
+        self.renameItem = renameItem
+
+    def rename(self):
+        print(self.renameItem)
+        safeRename(self.renameItem.getPath(), self.renameItem.getRenamePath())
+
+    def getDirectory(self):
+        return os.path.dirname(self.renameItem.getPath())
+
+class MultiRenameStrategy:
+    # each item in renameItems must be in the same directory
+    # the renameItems must not be empty
+    def __init__(self, tempDir, renameItems):
+        self.renameItems = renameItems
+        self.tempDir = tempDir
+
+    def append(self, renameItem):
+        self.renameItems.append(renameItem)
+
+    def rename(self):
+        for item in self.renameItems[:-1]:
+            print(item.getDisplayPath(), "->", self.tempDir / item.getName())
+            safeRename(item.getPath(), self.tempDir / item.getName())
+        SingleRenameStrategy(self.renameItems[-1]).rename()
+        for item in self.renameItems[:-1]:
+            print(self.tempDir / item.getName(), "->", item.getRename())
+            safeRename(self.tempDir / item.getName(), item.getRenamePath())
+
+    def getDirectory(self):
+        return os.path.dirname(self.renameItems[0].getPath())
+
+class MassRenamer:
+    def __init__(self, editor="vim", tempDir=".massren-tmp"):
+        self.editor = editor
+        self.tempDir = pathlib.PurePath(tempDir)
+        self.tmp_files = set()
+        self.renameItems = []
+        self.requiresTemp = False
+        self.tempDirectory = None
+
+    def setItems(self, renameItems):
+        self.renameItems = renameItems
+
+    def _createTmpFile(self):
+        tmp = tempfile.NamedTemporaryFile(prefix="massren-")
+        for item in self.renameItems:
+            buffer = bytes(str(item.getName()), encoding="UTF-8")
+            tmp.write(buffer + b"\n")
+        tmp.flush()
+        return tmp;
+    
+    def _readTmpFile(self, tmp):
+        tmp.seek(0)
+        renames = str(tmp.read(), encoding="UTF-8").split("\n")[:-1]
+        if len(renames) != len(self.renameItems):
+            ErrorManager.abort("the number of files changed")
+        for i, rename in enumerate(renames):
+            item = self.renameItems[i]
+            if rename != item.getName():
+                item.setRename(rename)
+        ErrorManager.abortIfError()
+
+    def _removeEmptyRenames(self):
+        filterFunc = lambda c: c.getRename()
+        self.renameItems = list(filter(filterFunc, self.renameItems))
+
+    def _inputRenames(self):
+        tmp = self._createTmpFile()
+        subprocess.run([self.editor, tmp.name])
+        self._readTmpFile(tmp)
+        self._removeEmptyRenames()
+
+    # checks that there are not multiple renames to the same name
+    def _validateSameDests(self):
+        renames = set()
+        for item in self.renameItems:
+            if item.getRenamePath() in renames:
+                fmt = "multiple files being renamed to '%s'"
+                ErrorManager.error(fmt % item.getRenamePath())
+            if item.getRenamePath() != item.getPath():
+                renames.add(item.getRenamePath())
+        ErrorManager.abortIfError()
+
+    # checks that no dests exist so that no files will be replaced
+    def _validateExistingDest(self):
+        itemLookup = set()
+        for item in self.renameItems:
+            itemLookup.add(item.getPath())
+        for item in self.renameItems:
+            if not os.path.exists(item.getRenamePath()):
+                continue
+            if item.getRenamePath() not in itemLookup:
+                ErrorManager.error(item, "would replace another file")
+        ErrorManager.abortIfError()
+
+    # checks that user has rw permissions on each file and its dest
+    def _validatePermissions(self):
+        checked = set()
+        for item in self.renameItems:
+            itemPath = item.getPath()
+            itemRenameDir = os.path.dirname(item.getRenamePath())
+            for path in [itemRenameDir, itemPath]:
+                if path in checked:
+                    continue
+                checked.add(path)
+                if not os.access(path, os.R_OK | os.W_OK):
+                    ErrorManager.error("insufficient permissions for", path)
+        ErrorManager.abortIfError()
+
+    # reorganize renames so that overwrites are avoided
+    def _handleClashingRenames(self):
+        itemPaths = {}
+        for item in self.renameItems:
+            itemPaths[item.getPath()] = item
+
+        self.renameStrategies = []
+        remainingItems = self.renameItems
+        
+        while True:
+            lastSize = len(remainingItems)
+            newRemainingItems = []
+            for item in remainingItems:
+                if item.getRenamePath() in itemPaths:
+                    newRemainingItems.append(item)
+                    continue
+                self.renameStrategies.append(SingleRenameStrategy(item))
+                del itemPaths[item.getPath()]
+                itemPaths[item.getRenamePath()] = item
+            remainingItems, newRemainingItems = newRemainingItems, []
+            if len(remainingItems) == lastSize:
+                break
+
+        if remainingItems:
+            self.requiresTemp = True
+            groupLookup = {}
+            for item in remainingItems:
+                partner = itemPaths[item.getRenamePath()]
+                group = groupLookup.get(item.getPath(), None)
+                if group is None:
+                    group = groupLookup.get(partner.getPath(), None)
+                    if group is None:
+                        group = []
+                        strategy = MultiRenameStrategy(self.tempDir, group)
+                        self.renameStrategies.append(strategy)
+                groupLookup[item.getPath()] = group
+                groupLookup[partner.getPath()] = group
+                group.append(item)
+
+    # sort renames so nested files are renamed before their parents
+    def _sortRenames(self):
+        def item_path_relative_comp(a, b):
+            path_a = pathlib.PurePath(a.getDirectory())
+            path_b = pathlib.PurePath(b.getDirectory())
+            if path_a.is_relative_to(path_b): return -1
+            if path_b.is_relative_to(path_a): return 1
+            return 0
+        key = functools.cmp_to_key(item_path_relative_comp)
+        self.renameStrategies.sort(key=key)
+
+    def _rename(self):
+        nRenames = 0
+        if self.requiresTemp:
+            print("creating temporary directory", self.tempDir)
+            if os.path.exists(self.tempDir):
+                msg = "cannot create %s as it already exists" % self.tempDir
+                ErrorManager.abort(msg)
+            os.mkdir(self.tempDir)
+        for renameStrategy in self.renameStrategies:
+            renameStrategy.rename()
+        if self.requiresTemp:
+            print("removing temporary directory", self.tempDir)
+            os.rmdir(self.tempDir)
+        print("\n%d file(s) renamed." % len(self.renameItems))
+
+    def massren(self):
+        self._inputRenames()
+        if not self.renameItems:
+            return
+        self._validateSameDests()
+        self._validateExistingDest()
+        self._validatePermissions()
+        self._handleClashingRenames()
+        self._sortRenames()
+        self._rename()
+
+def extractRenameItems(paths):
+    added = set()
+    items = []
+    for path in paths:
+        abspath = os.path.abspath(path)
+        if abspath in added:
+            ErrorManager.error(abspath, "supplied multiple times")
+            continue
+        if not os.path.exists(path):
+            ErrorManager.error(abspath, "not found")
+        added.add(abspath)
+        items.append(RenameItem(path))
+    ErrorManager.abortIfError()
+    return items
+
+if __name__ == "__main__":
+    editor = os.environ.get("EDITOR", "vim")
+    if not shutil.which(editor):
+        fmt = "the editor '%s' cannot be found or is not executable"
+        ErrorManager.abort(fmt % editor)
+
+    files = os.listdir() if len(sys.argv) == 1 else sys.argv[1:]
+    items = extractRenameItems(files)
+
+    massRenamer = MassRenamer(editor=editor)
+    massRenamer.setItems(items)
+    massRenamer.massren()
