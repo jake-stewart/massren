@@ -285,9 +285,11 @@ if __name__ == "__main__":
         fmt = "the editor '%s' cannot be found or is not executable"
         ErrorManager.abort(fmt % editor)
 
-    files = os.listdir() if len(sys.argv) == 1 else sys.argv[1:]
-    items = extractRenameItems(files)
-
+    if len(sys.argv) == 1:
+        files = os.listdir()
+        files.sort()
+    else:
+        files = sys.argv[1:]
     massRenamer = MassRenamer(editor=editor)
-    massRenamer.setItems(items)
+    massRenamer.setItems(extractRenameItems(files))
     massRenamer.massren()
