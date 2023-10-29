@@ -15,20 +15,26 @@ else:
     ILLEGAL_CHARS = "/" 
 
 class ErrorManager:
-    hasError = False
+    numErrors = 0
 
+    @staticmethod
     def error(arg1, *args):
-        ErrorManager.hasError = True
+        ErrorManager.numErrors += 1
         print("error:", arg1, *args, file=sys.stderr)
+        if ErrorManager.numErrors >= 10:
+            print("too many errors. aborted.", file=sys.stderr)
+            exit(1)
 
+    @staticmethod
     def abort(*args):
         if args:
             ErrorManager.error(*args)
         print("error(s) occurred. aborted.")
         exit(1)
 
+    @staticmethod
     def abortIfError():
-        if ErrorManager.hasError:
+        if ErrorManager.numErrors:
             ErrorManager.abort()
 
 def safeRename(src, dest):
@@ -114,13 +120,20 @@ class MassRenamer:
     def __init__(self, editor="vim", tempDir=".massren-tmp"):
         self.editor = editor
         self.tempDir = pathlib.PurePath(tempDir)
+        self.checkedPermissions = set()
         self.tmp_files = set()
         self.renameItems = []
+        self.deletedPaths = set()
+        self.deleteItems = []
         self.requiresTemp = False
         self.tempDirectory = None
+        self.deletionString = None
 
     def setItems(self, renameItems):
         self.renameItems = renameItems
+
+    def setDeletionString(self, deletionString):
+        self.deletionString = deletionString
 
     def _createTmpFile(self):
         tmp = tempfile.NamedTemporaryFile(prefix="massren-")
@@ -128,16 +141,19 @@ class MassRenamer:
             buffer = bytes(str(item.getName()), encoding="UTF-8")
             tmp.write(buffer + b"\n")
         tmp.flush()
-        return tmp;
+        return tmp
     
     def _readTmpFile(self, tmp):
-        tmp.seek(0)
-        renames = str(tmp.read(), encoding="UTF-8").split("\n")[:-1]
+        with open(tmp.name, "r") as f:
+            renames = f.read().split("\n")[:-1]
         if len(renames) != len(self.renameItems):
             ErrorManager.abort("the number of files changed")
         for i, rename in enumerate(renames):
             item = self.renameItems[i]
-            if rename != item.getName():
+            if rename == self.deletionString:
+                self.deletedPaths.add(item.getPath())
+                self.deleteItems.append(item)
+            elif rename != item.getName():
                 item.setRename(rename)
         ErrorManager.abortIfError()
 
@@ -170,22 +186,30 @@ class MassRenamer:
         for item in self.renameItems:
             if not os.path.exists(item.getRenamePath()):
                 continue
+            if item.getRenamePath() in self.deletedPaths:
+                continue
             if item.getRenamePath() not in itemLookup:
                 ErrorManager.error(item, "would replace another file")
         ErrorManager.abortIfError()
 
+    def _validatePermissions(self, path):
+        if path in self.checkedPermissions:
+            return
+        self.checkedPermissions.add(path)
+        if not os.access(path, os.R_OK | os.W_OK):
+            ErrorManager.error("insufficient permissions for", path)
+
+    # checks that user has rw permissions on each file
+    def _validateDeletePermissions(self):
+        for item in self.deleteItems:
+            self._validatePermissions(item.getPath())
+        ErrorManager.abortIfError()
+
     # checks that user has rw permissions on each file and its dest
-    def _validatePermissions(self):
-        checked = set()
+    def _validateRenamePermissions(self):
         for item in self.renameItems:
-            itemPath = item.getPath()
-            itemRenameDir = os.path.dirname(item.getRenamePath())
-            for path in [itemRenameDir, itemPath]:
-                if path in checked:
-                    continue
-                checked.add(path)
-                if not os.access(path, os.R_OK | os.W_OK):
-                    ErrorManager.error("insufficient permissions for", path)
+            self._validatePermissions(item.getPath())
+            self._validatePermissions(os.path.dirname(item.getRenamePath()))
         ErrorManager.abortIfError()
 
     # reorganize renames so that overwrites are avoided
@@ -227,6 +251,25 @@ class MassRenamer:
                 groupLookup[partner.getPath()] = group
                 group.append(item)
 
+    # sort deletes so nested files are deleted before their parents
+    def _sortDeletions(self):
+        def item_path_relative_comp(a, b):
+            path_a = pathlib.PurePath(a.getPath())
+            path_b = pathlib.PurePath(b.getPath())
+            if path_a.is_relative_to(path_b): return -1
+            if path_b.is_relative_to(path_a): return 1
+            return 0
+        key = functools.cmp_to_key(item_path_relative_comp)
+        self.deleteItems.sort(key=key)
+
+    def _delete(self):
+        for deleteItem in self.deleteItems:
+            if os.path.isdir(deleteItem.getPath()):
+                shutil.rmtree(deleteItem.getPath())
+            else:
+                os.remove(deleteItem.getPath())
+            print("deleted", deleteItem.getName())
+
     # sort renames so nested files are renamed before their parents
     def _sortRenames(self):
         def item_path_relative_comp(a, b):
@@ -239,7 +282,6 @@ class MassRenamer:
         self.renameStrategies.sort(key=key)
 
     def _rename(self):
-        nRenames = 0
         if self.requiresTemp:
             print("creating temporary directory", self.tempDir)
             if os.path.exists(self.tempDir):
@@ -251,18 +293,33 @@ class MassRenamer:
         if self.requiresTemp:
             print("removing temporary directory", self.tempDir)
             os.rmdir(self.tempDir)
-        print("\n%d file(s) renamed." % len(self.renameItems))
+
+    def _printResults(self):
+        def output(n, verb):
+            return "%d file%s %s." % (n, "" if n == 1 else "s", verb)
+        print()
+        if self.deleteItems:
+            print(output(len(self.deleteItems), "deleted"))
+        if self.renameItems:
+            print(output(len(self.renameItems), "renamed"))
 
     def massren(self):
         self._inputRenames()
-        if not self.renameItems:
+        if not self.deleteItems and not self.renameItems:
             return
-        self._validateSameDests()
-        self._validateExistingDest()
-        self._validatePermissions()
-        self._handleClashingRenames()
-        self._sortRenames()
-        self._rename()
+        if self.renameItems:
+            self._validateSameDests()
+            self._validateExistingDest()
+            self._validateRenamePermissions()
+            self._handleClashingRenames()
+        if self.deleteItems:
+            self._validateDeletePermissions()
+            self._sortDeletions()
+            self._delete()
+        if self.renameItems:
+            self._sortRenames()
+            self._rename()
+        self._printResults()
 
 def extractRenameItems(paths):
     added = set()
@@ -285,11 +342,29 @@ if __name__ == "__main__":
         fmt = "the editor '%s' cannot be found or is not executable"
         ErrorManager.abort(fmt % editor)
 
-    if len(sys.argv) == 1:
+    deletionString = None
+    files = []
+
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg == "-d":
+            if i + 1 == len(sys.argv):
+                ErrorManager.abort("option %s is missing a value" % arg)
+            deletionString = sys.argv[i + 1]
+            i += 2
+        else:
+            files = sys.argv[i:]
+            break
+
+    if not sys.stdin.isatty():
+        files += sys.stdin.read().split("\n")
+        files.pop(-1);
+    elif not files:
         files = os.listdir()
         files.sort()
-    else:
-        files = sys.argv[1:]
+
     massRenamer = MassRenamer(editor=editor)
+    massRenamer.setDeletionString(deletionString)
     massRenamer.setItems(extractRenameItems(files))
     massRenamer.massren()
